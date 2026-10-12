@@ -1,0 +1,119 @@
+name: Build liuran001 mihomo smart-ebpf (android-arm64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout liuran001/mihomo
+        uses: actions/checkout@v4
+        with:
+          repository: liuran001/mihomo
+          ref: Alpha
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+
+      - name: Configure cross toolchain
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          go version
+          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/" | grep -c clang || true
+          {
+            echo "NDK_PATH=$NDK"
+            echo "CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+            echo "CGO_ENABLED=1"
+            echo "GOOS=android"
+            echo "GOARCH=arm64"
+            echo "GOTOOLCHAIN=local"
+          } >> "$GITHUB_ENV"
+          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod tidy
+
+      - name: Patch sing-tun (idempotent)
+        run: |
+          set -euo pipefail
+          V="$(go list -m github.com/metacubex/sing-tun | awk '{print $2}')"
+          D="$(go env GOMODCACHE)/github.com/metacubex/sing-tun@${V}"
+          echo "sing-tun ${V}"
+          echo "dir: ${D}"
+          chmod -R +w "$D"
+          cd "$D"
+          cp "$GITHUB_WORKSPACE/.github/patch/sing-tun.patch" ./sing-tun.patch
+          if grep -q 'if len(r.tunOptions.Inet6Address) > 0 && runtime.GOOS == "android"' redirect_linux.go 2>/dev/null; then
+            echo "patch already applied, skipping"
+            exit 0
+          fi
+          if patch -p1 --reverse --dry-run < sing-tun.patch 2>/dev/null; then
+            echo "patch already applied (reverse dry-run), skipping"
+            exit 0
+          fi
+          patch -p1 < sing-tun.patch
+          grep -A5 'if len(r.tunOptions.Inet6Address) > 0' redirect_linux.go || true
+
+      - name: Repoint core updater
+        run: |
+          sed -i 's|github\.com/MetaCubeX/mihomo|github.com/TanakaLun/mihomo|g' ./component/updater/update_core.go
+
+      - name: Refresh embedded CA bundle
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: Build eBPF objects and binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          SHORT="$(git rev-parse --short HEAD)"
+          VERSION="alpha-smart-${SHORT}-ebpf"
+          BUILDTIME="$(date)"
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          go clean -cache
+          make ebpf_generate
+          go build -v -tags "with_gvisor with_ebpf" -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+            -o mihomo
+          ls -l mihomo
+
+      - name: Strip, compress, checksum
+        run: |
+          set -euo pipefail
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all mihomo
+          cp mihomo mihomo-android-arm64
+          gzip -c mihomo-android-arm64 > "mihomo-android-arm64-${VERSION}.gz"
+          sha256sum mihomo-android-arm64-*.gz | tee mihomo-android-arm64.sha256
+          cp mihomo-android-arm64-*.gz mihomo-android-arm64.sha256 dist/
+          echo "$VERSION" > dist/VERSION
+          echo "$(git rev-parse HEAD)" > dist/COMMIT_SHA
+          echo "android/arm64" > dist/PLATFORM
+          ls -l dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-liuran-android-arm64
+          path: dist/*
+          if-no-files-found: error
