@@ -23,27 +23,58 @@ jobs:
           go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
           go-version: "1.26"
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        id: ndk
-        with:
-          ndk-version: r29
-
-      - name: Configure cross toolchain
+      - name: Locate NDK (and detect a Clang 21 one for bpf generation)
         run: |
           set -euo pipefail
-          NDK="${{ steps.ndk.outputs.ndk-path }}"
-          go version
-          ls "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/" | grep -c clang || true
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          echo "SDK=$SDK"
+          SDKMGR="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -n1)"
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          echo "=== preinstalled ndk ==="
+          ls "$SDK/ndk" 2>/dev/null || echo "(none)"
+
+          NDK_ANY=""
+          NDK_CLANG21=""
+          scan() {
+            for d in "$SDK"/ndk/*; do
+              [ -d "$d" ] || continue
+              local bin="$d/toolchains/llvm/prebuilt/linux-x86_64/bin"
+              [ -x "$bin/clang" ] || continue
+              local v
+              v="$("$bin/clang" --version 2>/dev/null | head -n1)"
+              echo "  $d -> $v"
+              [ -n "$NDK_ANY" ] || NDK_ANY="$d"
+              if [ -z "$NDK_CLANG21" ]; then
+                case "$v" in *"clang version 21."*) NDK_CLANG21="$d";; esac
+              fi
+            done
+          }
+          scan
+
+          if [ -z "$NDK_ANY" ] || [ -z "$NDK_CLANG21" ]; then
+            for ver in 29.0.14206865 29.0.14434698 28.2.13676358; do
+              if "$SDKMGR" --install "ndk;$ver" >/dev/null 2>&1 && [ -d "$SDK/ndk/$ver" ]; then
+                echo "installed ndk;$ver"
+              fi
+            done
+            echo "=== after install ==="
+            scan
+          fi
+
+          [ -n "$NDK_ANY" ] || { echo "no NDK available"; exit 1; }
+          CC="$NDK_ANY/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          test -x "$CC"
+          echo "using NDK      : $NDK_ANY"
+          echo "clang21 for bpf: ${NDK_CLANG21:-<none>}"
           {
-            echo "NDK_PATH=$NDK"
-            echo "CC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+            echo "NDK_PATH=$NDK_ANY"
+            echo "NDK_CLANG21=$NDK_CLANG21"
+            echo "CC=$CC"
             echo "CGO_ENABLED=1"
             echo "GOOS=android"
             echo "GOARCH=arm64"
             echo "GOTOOLCHAIN=local"
           } >> "$GITHUB_ENV"
-          test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
 
       - name: Download dependencies
         run: |
@@ -92,7 +123,13 @@ jobs:
           echo "VERSION=$VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           go clean -cache
-          make ebpf_generate
+          if [ -n "${NDK_CLANG21:-}" ]; then
+            ANDROID_NDK_HOME="$NDK_CLANG21" make ebpf_generate
+            echo "bpf objects regenerated with $(ANDROID_NDK_HOME="$NDK_CLANG21" "$NDK_CLANG21/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -n1)"
+          else
+            echo "::warning::no Clang 21 NDK available; building with the committed BPF objects in common/ebpf/internal/bpfgen"
+            ls -l common/ebpf/internal/bpfgen/*.o | head -n 20
+          fi
           go build -v -tags "with_gvisor with_ebpf" -trimpath \
             -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
             -o mihomo
