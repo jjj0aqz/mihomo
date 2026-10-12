@@ -1,0 +1,59 @@
+name: Build mihomo eBPF core (android-arm64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout eBPF branch
+        uses: actions/checkout@v4
+        with:
+          repository: TanakaLun/mihomo
+          ref: ebpf-inbound
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: "1.26"
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          go version
+          git log -1 --format='%H %ad %s' --date=iso
+
+      - name: Build android/arm64
+        env:
+          GOOS: android
+          GOARCH: arm64
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="$(git describe --tags --always --abbrev=12)"
+          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "version=$version  build_time=$build_time"
+          out="dist/mihomo-ebpf-android-arm64"
+          CGO_ENABLED=0 go build -v \
+            -tags "with_gvisor with_ebpf" \
+            -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' -w -s -buildid=" \
+            -o "$out" .
+          sha256sum "$out" | tee "$out.sha256"
+          echo "$version" > dist/VERSION
+          echo "android/arm64" > dist/PLATFORM
+          echo "$(git rev-parse HEAD)" > dist/COMMIT_SHA
+          ls -l dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-ebpf-android-arm64
+          path: dist/*
+          if-no-files-found: error
